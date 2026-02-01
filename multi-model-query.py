@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-BEDROCK_TOKEN = os.environ.get("BEDROCK_TOKEN", "")
+BEDROCK_TOKEN = os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "")
 
 # All models with their regions
 MODELS = {

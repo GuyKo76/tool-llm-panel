@@ -48,18 +48,25 @@ python3 multi-model-query.py --file prompt.txt --max-tokens 4096
 
 Single-file tool using only Python standard library (no pip dependencies). Uses `concurrent.futures.ThreadPoolExecutor` to query all models in parallel.
 
+**Authentication**: Reads `AWS_BEARER_TOKEN_BEDROCK` from environment (sourced from `~/.secrets`).
+
 **Model regions**: Most models run in `us-east-1`, but Qwen and DeepSeek models require `us-east-2`.
 
-**Response handling**: Supports both direct text responses and reasoning/thinking model outputs (e.g., Kimi K2, MiniMax M2).
+**Response handling**: Supports both direct text responses and reasoning/thinking model outputs (e.g., Kimi K2, MiniMax M2). Reasoning models output is prefixed with `[Reasoning]`.
+
+**Timeout**: 300 seconds per model request.
+
+## File Naming Convention
+
+Files use date prefixes for chronological sorting:
+```
+YYYY-MM-DD-<topic>-prompt.txt     # Input prompt
+YYYY-MM-DD-<topic>-responses.md   # Model outputs
+```
 
 ## Available Models
 
-- **Anthropic**: Claude Opus 4.5, Sonnet 4.5, Haiku 4.5
-- **OpenAI**: GPT OSS 120B
-- **Qwen**: Qwen3 235B, Qwen3 Coder 480B (us-east-2)
-- **Google**: Gemma 3 27B
-- **NVIDIA**: Nemotron Nano 12B
-- **Others**: Moonshot Kimi K2, MiniMax M2, DeepSeek V3.1 (us-east-2)
+Run `python3 multi-model-query.py --list-models` for current list. Models span Anthropic, OpenAI, Qwen, Google, NVIDIA, Moonshot, MiniMax, and DeepSeek.
 
 ## Output Format
 

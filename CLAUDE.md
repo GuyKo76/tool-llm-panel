@@ -2,30 +2,46 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Purpose
+
+**When the user provides a question or prompt, your job is to:**
+1. Save it to a `.txt` file (no modifications)
+2. Run it through all Bedrock models using `multi-model-query.py`
+3. Collect outputs into an organized markdown file (no modifications)
+
+**Critical: Zero manipulation.** The prompt goes in exactly as given. Model outputs are collected exactly as returned. No summarizing, no editing, no "improvements" on either end.
+
 ## Overview
 
-Multi-model query tool for comparing responses from various LLM providers through AWS Bedrock. Sends the same prompt to multiple models in parallel and generates a markdown report comparing responses.
+Multi-model query tool for comparing responses from various LLM providers through AWS Bedrock. Sends the same prompt to multiple models in parallel and generates a markdown report organized by model/provider.
+
+## Typical Workflow
+
+```bash
+# 1. Save user's prompt to file (no modifications)
+# 2. Run against all models
+python3 multi-model-query.py --file prompt.txt --output responses.md
+
+# 3. Results are in responses.md, organized by provider/model
+```
 
 ## Commands
 
 ```bash
+# Run with prompt from file (preferred)
+python3 multi-model-query.py --file prompt.txt --output results.md
+
 # Run with inline prompt
-python multi-model-query.py "Your prompt here"
-
-# Run with prompt from file
-python multi-model-query.py --file prompt.txt
-
-# Custom output file
-python multi-model-query.py "prompt" --output results.md
+python3 multi-model-query.py "Your prompt here"
 
 # Query specific models only
-python multi-model-query.py "prompt" --models "Claude Opus 4.5" "DeepSeek V3.1"
+python3 multi-model-query.py "prompt" --models "Claude Opus 4.5" "DeepSeek V3.1"
 
 # List available models
-python multi-model-query.py --list-models
+python3 multi-model-query.py --list-models
 
 # Set max tokens (default: 8192)
-python multi-model-query.py "prompt" --max-tokens 4096
+python3 multi-model-query.py --file prompt.txt --max-tokens 4096
 ```
 
 ## Architecture

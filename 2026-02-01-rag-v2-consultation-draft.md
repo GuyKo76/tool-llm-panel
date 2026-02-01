@@ -1,0 +1,354 @@
+# Expert Consultation: Optimizing a RAG System for Maximum Accuracy, Speed, and Serendipity
+
+## Request Summary
+
+I need expert guidance on optimizing my custom RAG system. **All three priorities must be maximized simultaneously—there are no trade-offs:**
+
+1. **ACCURACY**: Find ALL relevant sources, never miss critical content
+2. **SPEED**: Target <20s end-to-end (currently 28-72s depending on complexity)
+3. **SERENDIPITY**: Surface unexpected but valuable connections users didn't know to search for
+
+**Constraints:**
+- Must use **free/open-source components** (can keep current paid models: Cohere Embed V4, Claude Opus/Sonnet via AWS Bedrock)
+- Corpus: ~1,600 documents, ~30M words, growing ~10-20 docs/month
+- Self-hosted on Linux (WSL2), Python 3.11
+
+---
+
+## System Architecture (Current State)
+
+### Corpus Characteristics
+
+| Metric | Value |
+|--------|-------|
+| Documents | ~1,600 podcast transcripts |
+| Total words | ~30 million |
+| Content type | Long-form podcast transcripts, interviews, book excerpts |
+| Domain | Specialized (UFO research, consciousness studies, paranormal) |
+| Document length | 2K - 150K words per document |
+| Chunks | ~65,000 (500 tokens each, 50-token overlap) |
+
+**Content characteristics:**
+- Domain-specific vocabulary with **vocabulary gaps**: "tall whites" = "Nordic aliens" = "beings with snow-white hair"
+- Named entities are critical: same person appears as "Bob Lazar", "Robert Lazar", "Lazar"
+- Cross-document references: same guests appear across multiple podcasts
+- Contradictory claims: multiple sources may disagree on the same topic
+- Long documents: critical mentions may be buried deep (100K-word transcripts)
+
+### Database Schema
+
+```
+corpus.db (SQLite + sqlite-vec extension)
+├── transcripts (id, file_path, title, date, speakers, word_count, summary)
+├── chunks (id, transcript_id, chunk_index, text, start_char, end_char)
+├── vec_chunks (chunk_id, embedding FLOAT[1536])  -- sqlite-vec virtual table
+└── vec_summaries (transcript_id, embedding FLOAT[1536])
+
+corpus_graph.db (Document relationships)
+├── document_entities (document_id, entity_text, entity_type, frequency)
+├── document_keywords (document_id, keyword, tfidf_score)
+├── corpus_edges (source_id, target_id, embedding_sim, entity_overlap, keyword_overlap)
+├── document_clusters (document_id, cluster_id, centrality_score, is_bridge)
+└── clusters (cluster_id, name, size, top_keywords, top_entities)
+
+fts5_index.db (Keyword search)
+└── documents_fts (title, content, folder, speakers)  -- FTS5 virtual table
+```
+
+### Embedding & Chunking
+
+- **Embedding model**: Cohere Embed V4 (1536 dimensions) via AWS Bedrock
+- **Chunking**: 500 tokens (tiktoken cl100k_base), 50-token overlap
+- **Separators**: Recursive semantic splitting: `["\n\n", "\n", ". ", " "]`
+- **Pre-computed summaries**: 500-word LLM-generated summaries per document
+
+### Graph Construction
+
+- **Entity extraction**: spaCy NER on summaries (PERSON requires 2+ words to avoid collisions)
+- **Keyword extraction**: TF-IDF with 5000 features, bigrams, min_df=2, max_df=0.8
+- **Edge creation**: Document pairs connected if ANY threshold exceeded:
+  - Embedding similarity ≥ 0.3 (cosine)
+  - Entity overlap ≥ 0.05 (Jaccard)
+  - Keyword overlap ≥ 0.08 (Jaccard)
+- **Clustering**: NetworkX Louvain community detection (resolution=1.0)
+- **Bridge detection**: Top 10% betweenness centrality AND connects 3+ clusters
+
+---
+
+## Current Retrieval Pipeline (V2)
+
+```
+Query → Classification → Expansion → Parallel Search → RRF Fusion → Reranking → MMR → Synthesis
+```
+
+### Step 1: Query Classification (regex patterns, ~1ms)
+
+Classifies into `simple`, `moderate`, or `complex` based on patterns:
+
+```python
+params = {
+    "simple": {"retrieve_k": 50, "top_k": 30, "mmr_k": 20, "mmr_lambda": 0.8},
+    "moderate": {"retrieve_k": 100, "top_k": 50, "mmr_k": 30, "mmr_lambda": 0.7},
+    "complex": {"retrieve_k": 150, "top_k": 75, "mmr_k": 40, "mmr_lambda": 0.6, "use_opus": True}
+}
+```
+
+- Simple: "Who is X?", "What is X?", single entity lookups
+- Moderate: "What do people say about X?", how/why questions
+- Complex: comparisons, contradictions, multiple perspectives
+
+### Step 2: Query Expansion (deterministic, no LLM, ~2ms)
+
+**Entity expansion** (`entities.yaml`):
+```yaml
+bob_lazar:
+  canonical: "Bob Lazar"
+  aliases: ["Robert Lazar", "Lazar", "robert lazar"]
+```
+Query "bob lazar" → ["bob lazar", "Robert Lazar", "Lazar"]
+
+**Vocabulary expansion** (`vocabulary.yaml`):
+```yaml
+tall_whites:
+  synonyms: ["Nordic aliens", "Nordic beings", "snow white hair"]
+```
+Query "tall whites" → adds "Nordic aliens" as parallel search term
+
+**Result**: 1-5 query variations for parallel search
+
+### Step 3: Parallel Dense + Sparse Search (~4-5s)
+
+**Dense (vector) search**:
+1. Batch embed all expanded queries via Cohere Embed V4
+2. For each embedding, search `vec_chunks` table (sqlite-vec):
+   ```sql
+   SELECT v.chunk_id, v.distance FROM vec_chunks v
+   WHERE v.embedding MATCH ? AND k = ?
+   ORDER BY v.distance
+   ```
+3. Deduplicate by chunk_id, keep lowest distance
+
+**Sparse (FTS5) search**:
+1. For each expanded query, BM25 keyword search on `documents_fts`
+2. Return top matches with snippets
+3. Convert FTS rank to pseudo-distance: `distance = 0.5 + (fts_rank / 40)`
+
+### Step 4: RRF Fusion (~100ms)
+
+Reciprocal Rank Fusion combines dense + sparse:
+```
+RRF_score[doc] = Σ 1/(k + rank_i)  where k=60
+```
+- Document appearing in both lists gets combined score
+- Sorted by total RRF score descending
+
+### Step 5: Local Reranking (~0.5s)
+
+**Model**: BGE-Reranker-v2-m3 (BAAI/bge-reranker-v2-m3, ~1GB, MIT license)
+- Cross-encoder taking (query, chunk) pairs
+- Batch size 32, outputs relevance scores
+- **10x faster** than Cohere API (0.3-0.5s vs 3-5s)
+- ~5% lower quality than Cohere Rerank 3.5
+
+```python
+scores = model.predict(
+    [(query, chunk["text"]) for chunk in chunks],
+    batch_size=32
+)
+```
+
+### Step 6: MMR Diversity Selection (~1-2s)
+
+Maximal Marginal Relevance balances relevance and diversity:
+```
+MMR = argmax[λ * Sim(q,d) - (1-λ) * max_sim(d, already_selected)]
+```
+
+- λ = 0.8 (simple): High relevance, low diversity
+- λ = 0.7 (moderate): Balanced
+- λ = 0.6 (complex): More diversity for multi-perspective queries
+
+**Algorithm**:
+1. Normalize relevance scores to [0,1]
+2. Pre-compute pairwise cosine similarity matrix of chunk embeddings
+3. Greedy selection: pick highest-relevance first, then iterate selecting max MMR
+
+### Step 7: Synthesis (20-60s - THE BOTTLENECK)
+
+**Model**: Claude Opus 4.5 (complex) or Sonnet 4.5 (simple/moderate) via Bedrock
+- Input: 20-40 reranked chunks (~15-25K tokens)
+- Output: Structured response with answer, connections, rabbit holes, sources
+- **This dominates total latency**
+
+---
+
+## Current Performance
+
+| Query Type | Retrieval | Synthesis | Total |
+|------------|-----------|-----------|-------|
+| Simple | 8-12s | 20-30s | 28-42s |
+| Moderate | 12-16s | 25-35s | 37-51s |
+| Complex | 16-24s | 40-60s | 56-84s |
+
+**Latency breakdown (moderate query)**:
+- Query classification: ~1ms
+- Entity/vocabulary expansion: ~2ms
+- Embedding queries (Cohere API): ~2-3s
+- Vector search (sqlite-vec): ~2-3s
+- FTS5 search: ~1-2s
+- RRF fusion: ~100ms
+- Reranking (local BGE): ~0.5s
+- MMR selection (embedding + matrix): ~2-3s
+- **Synthesis (Claude): 25-35s ← BOTTLENECK**
+
+---
+
+## The Graph (Currently Underutilized)
+
+The `corpus_graph.db` has pre-computed:
+- **~15 clusters** via Louvain community detection
+- **Entity overlaps** across documents (shared people, places)
+- **Bridge documents** connecting multiple clusters
+- **Centrality scores** for each document
+
+**Currently NOT used in V2 pipeline**. The old V1 pipeline used a 4-tier serendipity system:
+1. Tier 1: Confidence-weighted cluster loading (400K tokens of summaries)
+2. Tier 2: Random samples from "none" confidence clusters
+3. Tier 3: Entity-matched docs across ALL clusters
+4. Tier 4: Bridge docs + high centrality + random factor
+
+V2 replaced this with MMR, which is simpler but may be losing serendipity value.
+
+---
+
+## Specific Questions for Experts
+
+### ACCURACY
+
+1. **Vocabulary gaps**: I use deterministic YAML-based entity/synonym expansion. Is this sufficient, or should I use:
+   - HyDE (Hypothetical Document Embeddings)?
+   - Query2Doc?
+   - LLM-based expansion?
+   - Fine-tuned embedding model?
+
+2. **Long document problem**: A 100K-word document might mention a key topic once. My 500-word summary might not capture it. Options:
+   - Multiple summaries per document (sliding window)?
+   - Hierarchical retrieval (summary → section → chunk)?
+   - Late chunking / contextual retrieval (embed with document context)?
+   - Denser chunking for long documents?
+
+3. **Recall measurement**: I have no ground truth. How do I know what I'm missing? Strategies:
+   - Human evaluation benchmark?
+   - Synthetic test cases?
+   - LLM-as-judge for relevance?
+
+4. **RRF ratio**: Is `retrieve_k=100 → rerank → top_k=50 → MMR → 30` optimal? Should I retrieve more initially?
+
+### SPEED
+
+5. **Synthesis bottleneck**: Claude takes 20-60s. Options:
+   - Switch to Sonnet for all queries (faster but lower quality)?
+   - Smaller context window (fewer chunks)?
+   - Pre-computed answer fragments?
+   - Show intermediate results while synthesizing?
+   - **Is there a faster frontier model that maintains quality?**
+
+6. **MMR embedding cost**: MMR requires embedding all chunks after reranking (~2-3s). Alternatives:
+   - Pre-compute and cache all chunk embeddings?
+   - Use rerank scores as diversity proxy (skip embedding)?
+   - Approximate MMR without full similarity matrix?
+
+7. **Theoretical minimum**: For 30M words with high-quality RAG, what's the achievable floor? Am I close (28-42s) or far?
+
+### SERENDIPITY
+
+8. **MMR vs. Graph-based diversity**: I replaced 4-tier serendipity with MMR. Is this right? Options:
+   - DPP (Determinantal Point Processes)?
+   - Personalized PageRank / random walks on document graph?
+   - Cluster-based sampling alongside MMR?
+   - Re-introduce bridge documents?
+
+9. **Entity-driven serendipity**: Should I surface docs sharing entities regardless of cluster?
+   - "All docs mentioning Garry Nolan" even if in different topic clusters?
+
+10. **Query-dependent diversity**: Should λ be more dynamic?
+    - "Compare X and Y" → maximize diversity (λ=0.4)?
+    - "Who is X?" → minimize diversity (λ=0.9)?
+    - Learn λ from user feedback?
+
+11. **Evaluating serendipity**: How do I measure if unexpected results are valuable vs. noise?
+
+### ARCHITECTURE
+
+12. **Chunk-only vs. Summary-first**: V2 does direct chunk search. V1 searched summaries first, then chunks from selected docs. Which is better for accuracy AND serendipity?
+
+13. **Embedding model**: Is Cohere Embed V4 optimal? Alternatives:
+    - OpenAI text-embedding-3-large?
+    - Voyage AI?
+    - Open-source (nomic-embed-text, mxbai-embed-large)?
+    - Domain fine-tuned?
+
+14. **Reranker**: BGE-Reranker-v2-m3 is ~5% worse than Cohere. Worth the 10x speed gain? Alternatives:
+    - Cohere Rerank 3.5 (accuracy) vs. speed?
+    - Mixedbread rerank?
+    - Fine-tuned reranker on domain data?
+
+15. **Late chunking / contextual embeddings**: Should I embed chunks with document context?
+    ```
+    [Title: Episode 42 - UFO Disclosure]
+    [Summary: Discussion about government transparency...]
+    [Chunk]: The actual chunk text here...
+    ```
+
+16. **ColBERT / multi-vector retrieval**: Would ColBERT-style late interaction improve accuracy? Worth the indexing cost?
+
+### CONSOLIDATION
+
+17. **Mode reduction**: I had 5 modes, now effectively 3 (via query classification). Should I:
+    - Keep adaptive classification?
+    - Offer explicit "fast" vs "thorough" modes?
+    - Single mode that's good enough for all queries?
+
+18. **Graph utilization**: The corpus graph cost time to build. How should V2 use it?
+    - Add cluster sampling to MMR?
+    - Use entity edges for serendipity?
+    - Pre-compute "related documents" lists?
+
+---
+
+## Current Tech Stack (What Can Change)
+
+**Keep (paid, good quality)**:
+- Cohere Embed V4 (embeddings)
+- Claude Opus 4.5 / Sonnet 4.5 (synthesis)
+
+**Keep (free/open-source, working)**:
+- SQLite + sqlite-vec (vector storage)
+- FTS5 (keyword search)
+- BGE-Reranker-v2-m3 (reranking)
+- NetworkX Louvain (clustering)
+- spaCy en_core_web_sm (NER)
+- scikit-learn TF-IDF (keywords)
+
+**Open to changing**:
+- Chunking strategy (500 tokens → ?)
+- Graph algorithm (Louvain → ?)
+- Diversity mechanism (MMR → ?)
+- Query expansion approach
+- Any architectural pattern
+
+---
+
+## Summary: What I Need
+
+1. **Is my architecture fundamentally sound?** Or should I start over with a different pattern (knowledge graph, RAPTOR, graph RAG, etc.)?
+
+2. **What's the highest-impact change** to simultaneously improve accuracy, speed, and serendipity?
+
+3. **What am I over-engineering?** What adds complexity without proportional value?
+
+4. **What's missing?** Industry-standard techniques I should adopt?
+
+5. **How do I evaluate** without ground truth? Proxy metrics for all three priorities?
+
+**Remember**: Free/open-source components only (except current paid models). No trade-offs between accuracy, speed, and serendipity—I need to maximize all three.

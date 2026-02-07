@@ -73,3 +73,10 @@ Run `python3 multi-model-query.py --list-models` for current list. Models span A
 Generates markdown with:
 1. Summary table (model, provider, status, time, tokens)
 2. Full responses grouped by provider
+
+## Recommended Skills
+
+These globally-installed skills (`~/.claude/skills/`) are relevant to this project. Use them when the task matches:
+
+- **prompt-optimizer** — Transform prompts into structured specifications. Use when the user wants to refine a prompt before running it through the multi-model panel.
+- **aws-agentic-ai** — AWS agentic AI patterns. Use when extending model support or optimizing Bedrock API usage across providers.
